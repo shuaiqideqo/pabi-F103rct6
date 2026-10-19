@@ -1,0 +1,31 @@
+# GCC 编译产物
+build/
+build_log.txt
+*.o
+*.d
+*.elf
+*.hex
+*.bin
+*.map
+*.lst
+*.su
+
+# Keil 编译输出。链接脚本 .sct 保留
+pabi_F103rct6/MDK-ARM/pabi_F103rct6/*
+!pabi_F103rct6/MDK-ARM/pabi_F103rct6/*.sct
+*.crf
+*.axf
+*.htm
+*.lnp
+*.dep
+
+# Keil 个人界面和本地备份
+*.uvguix.*
+*.uvoptx
+*.bak*
+
+# 建仓库时用的临时脚本
+_git_init.bat
+_git_out.txt
+_git_commit.bat
+_commit_msg.txt
