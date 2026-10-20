@@ -1025,7 +1025,7 @@ static uint8_t Adj_WaitLoop(void){
 static void ApplyRemoteKey(int8_t key){
   if(key == 0) return;
   if(MODE == 11){
-    /* 作业模式: 风机(3增/4减/6停); 舵机1=下压(AUTO作业角) 2=抬升(回位);
+    /* 作业模式: 风机(3增/4减/6停); 舵机1=一点一点下压(+142/按) 2=一点一点抬升(-142/按);
        key9退出; key8=纠偏自检(ADJ_SELF_TEST=1时, 用占位常数跑一次演示纠偏) */
     if(key == 9){
       MODE = 9;                 /* key=9 退出作业模式, 回手操 */
@@ -1036,15 +1036,13 @@ static void ApplyRemoteKey(int8_t key){
              (int)ADJ_TEST_PHI, (int)ADJ_TEST_PSI, (int)ADJ_TEST_AX);
       Adj_Execute(ADJ_TEST_PHI, ADJ_TEST_PSI, ADJ_TEST_AX);
     } else if(key == 1){
-      /* 下压动作: 与AUTO的DUO_Motor_ON(DUO_NUM)完全一致 */
-      DUO_PWM_SET = (uint16_t)DUO_NUM;
-      DUO_Motor_ON(DUO_NUM);
-      printf("SERVO down %d\r\n", (int)DUO_NUM);
+      /* 下压: 一点一点往下(每按+142, 第一版行为), 不直接跳作业角 */
+      DUO_Motor_SET(1);
+      printf("SERVO down %d\r\n", (int)DUO_PWM_SET);
     } else if(key == 2){
-      /* 抬升动作: 与AUTO的DUO_Motor_OFF()完全一致(回499) */
-      DUO_PWM_SET = 500-1;
-      DUO_Motor_OFF();
-      printf("SERVO up 499\r\n");
+      /* 抬升: 一点一点往上(每按-142) */
+      DUO_Motor_SET(2);
+      printf("SERVO up %d\r\n", (int)DUO_PWM_SET);
     } else if(key == 3 || key == 4 || key == 6){
       FENG_Motor_SET(key);
     }
