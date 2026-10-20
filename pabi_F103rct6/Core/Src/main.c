@@ -813,8 +813,10 @@ void AUTO(void){
     if(GO_UP(roll_Compose)) { g_coop_report_en = 0; motor_STOP(); return; }
     motor_STOP();
 
-    /* 视觉纠偏等待: 本周期收过ADJ帧才启用; 母机发GOON(对齐)才发DONE */
+    /* 视觉纠偏等待: 本周期收过ADJ帧才启用; 先发REDY告知母机"GO_UP结束,可开始视觉纠偏";
+ * 母机发GOON(对齐)才发DONE */
     if(g_adj_armed){
+      Coop_SendFrame(REDY_RSP);   /* REDY②: GO_UP结束, 通知母机启动视觉纠偏 */
       if(Adj_WaitLoop()){ g_coop_report_en = 0; motor_STOP(); return; }  /* 中止/超时: 不发DONE */
     }
 
