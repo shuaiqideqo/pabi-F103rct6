@@ -411,6 +411,9 @@ void PID_IMU(float u_roll , int M_V_nomal)
 }
 
 uint8_t GO_FLAG = 0;
+/* 视觉纠偏状态: 母机经NRF发 ADJ,<phi>,<psi>,<ax> (执行器见 Adj_Execute) */
+static volatile uint8_t g_adj_armed = 0;   /* 本周期收到过ADJ帧=启用视觉纠偏 */
+static volatile float g_adj_phi = 0.0f, g_adj_psi = 0.0f, g_adj_ax = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -470,6 +473,7 @@ void DUO_Motor_SET(int8_t key){
 
 int8_t Arr_RX[32] = {0};
 static uint8_t Coop_PollAbort(void);
+static uint8_t Adj_WaitLoop(void);
 void Clear_All_PID(void);
 
 uint8_t FENG_Motor_ON(void){
@@ -515,7 +519,24 @@ void DUO_Motor_OFF(void){
 #define REDY_RSP  "REDY"
 #define DONE_RSP  "DONE"
 #define ACKD_RSP  "ACKD"
+#define ADJ_CMD   "ADJ,"        /* 纠偏帧: ADJ,<phi>,<psi>,<ax> (含ADJ,0,0,0使能) */
+#define ADJ_WAIT_MS  180000u    /* 纠偏等待总时限(ms), 超时视为母机失联 */
 #define COOP_IMU_PERIOD_MS  200u
+
+/* 解析 ADJ, 帧载荷 → 存入 g_adj_* */
+static void Adj_ParseStore(const uint8_t *buf){
+  char tmp[33];
+  char *p;
+  memcpy(tmp, buf, 32); tmp[32] = '\0';
+  p = tmp + 4;                                   /* 跳过"ADJ," */
+  g_adj_phi = (float)atof(p);
+  p = strchr(p, ',');
+  if(p != NULL){
+    g_adj_psi = (float)atof(p + 1);
+    p = strchr(p + 1, ',');
+    if(p != NULL) g_adj_ax = (float)atof(p + 1);
+  }
+}
 
 static uint8_t  g_coop_report_en = 0;
 static uint32_t g_imu_last_tx_us = 0;
@@ -549,7 +570,7 @@ static uint8_t Coop_IsProtoFrame(const uint8_t *buf){
   return (uint8_t)(Coop_FindFrame(buf, COOP_CMD) || Coop_FindFrame(buf, GOON_CMD) ||
                    Coop_FindFrame(buf, LOCK_CMD) || Coop_FindFrame(buf, STOP_CMD) ||
                    Coop_FindFrame(buf, REDY_RSP) || Coop_FindFrame(buf, DONE_RSP) ||
-                   Coop_FindFrame(buf, ACKD_RSP));
+                   Coop_FindFrame(buf, ACKD_RSP) || Coop_FindFrame(buf, ADJ_CMD));
 }
 
 /* 1=中止并写入 Arr_RX; STOP 清摇杆, 遥控帧原样拷贝 */
@@ -558,6 +579,10 @@ static uint8_t Coop_TakeAbort(const uint8_t *buf){
     memset(Arr_RX, 0, 32);
     printf("STOP received\r\n");
     return 1;
+  }
+  if(Coop_FindFrame(buf, ADJ_CMD)){
+    Adj_ParseStore(buf);        /* 纠偏帧: 记录偏差量+置armed, 不构成中止 */
+    return 0;
   }
   if(Coop_IsProtoFrame(buf)){
     return 0;
@@ -754,6 +779,7 @@ void AUTO(void){
     DUO_PWM_SET = 500-1;
     DUO_Motor_OFF();
     g_coop_report_en = 0;
+    g_adj_armed = 0;   /* 新周期: 重置纠偏武装, 母机发ADJ帧再使能 */
     printf("AUTO ready, wait COOP...\r\n");
     if(Coop_WaitFrame(COOP_CMD)) return;
 
@@ -786,6 +812,11 @@ void AUTO(void){
     /* GO_UP 返回: 0=到位 1=中止 2=超时。超时/中止都不上报DONE, 保持吸力回手动 */
     if(GO_UP(roll_Compose)) { g_coop_report_en = 0; motor_STOP(); return; }
     motor_STOP();
+
+    /* 视觉纠偏等待: 本周期收过ADJ帧才启用; 母机发GOON(对齐)才发DONE */
+    if(g_adj_armed){
+      if(Adj_WaitLoop()){ g_coop_report_en = 0; motor_STOP(); return; }  /* 中止/超时: 不发DONE */
+    }
 
     g_coop_report_en = 0;
     Coop_SendFrame(DONE_RSP);
@@ -954,6 +985,41 @@ out:
   printf("ADJ finish rc=%u\r\n", rc);
   return rc;
 }
+/* 纠偏等待循环(GO_UP到位且已武装时进入):
+ * 收 ADJ,φ,ψ,ax → Adj_Execute → 回REDY(可复测)
+ * 收 GOON → 对齐确认, 返回0(调用方发DONE)
+ * 收 STOP/遥控 → 返回1(中止); 180s无帧 → 返回2
+ * 期间 IMU 遥测保持开启 */
+static uint8_t Adj_WaitLoop(void){
+  uint32_t t0 = HAL_GetTick();
+  printf("ADJ wait: hold for vision\r\n");
+  while(1){
+    uint8_t buf[32];
+    Coop_ReportIMU();
+    if(NRF24L01_RxPacket(buf) == 0){
+      if(Coop_FindFrame(buf, GOON_CMD)){
+        printf("ADJ aligned\r\n");
+        return 0;                                   /* 对齐: 调用方发DONE */
+      }
+      if(Coop_FindFrame(buf, ADJ_CMD)){
+        uint8_t rc;
+        Adj_ParseStore(buf);
+        printf("ADJ exec phi=%d psi=%d ax=%d\r\n",
+               (int)g_adj_phi, (int)g_adj_psi, (int)g_adj_ax);
+        rc = Adj_Execute(g_adj_phi, g_adj_psi, g_adj_ax);
+        if(rc == 1) return 1;                       /* 中止 */
+        Coop_SendFrame(REDY_RSP);                   /* 步完成, 可复测 */
+      }
+      else if(Coop_TakeAbort(buf)){
+        return 1;                                   /* STOP/遥控接管 */
+      }
+    }
+    if(HAL_GetTick() - t0 > ADJ_WAIT_MS){
+      printf("ADJ wait timeout\r\n");
+      return 2;
+    }
+  }
+}
 static void ApplyRemoteKey(int8_t key){
   if(key == 0) return;
   if(MODE == 11){
@@ -1011,6 +1077,7 @@ static void ApplyRemoteKey(int8_t key){
  *   F=nnn  风机PWM直接设定(939~1800)
  *   S=nnnn 舵机PWM直接设定(499~2499)
  * 指令在主循环处理; AUTO运行期间只缓存最新一条, AUTO结束后执行 */
+#define PI_LINK_EN          0        /* 0=停用子机Pi串口通信(纠偏走NRF); 1=恢复网页手动控制 */
 #define PI_RX_LINE_MAX 24
 static uint8_t pi_rx_byte = 0;
 static volatile char    pi_rx_line[PI_RX_LINE_MAX];
@@ -1097,7 +1164,7 @@ int main(void)
   MX_SPI2_Init();
   MX_USART1_UART_Init();
   MX_USART2_UART_Init();
-  HAL_UART_Receive_IT(&huart2, &pi_rx_byte, 1);   /* 树莓派指令链路: 挂接收中断 */
+  if(PI_LINK_EN) HAL_UART_Receive_IT(&huart2, &pi_rx_byte, 1);   /* 树莓派指令链路: 挂接收中断 */
   MX_USART3_UART_Init();
   
   
@@ -1161,7 +1228,7 @@ int main(void)
 
   while (1)
   {
-    Pi_CMD_Process();   /* 处理树莓派串口指令(如有) */
+    if(PI_LINK_EN) Pi_CMD_Process();   /* 处理树莓派串口指令(PI_LINK_EN=0时停用) */
 
     if(NRF24L01_RxPacket((uint8_t *)Arr_RX)==0){
         if(Arr_RX[5] != 0){
