@@ -260,7 +260,11 @@ u8 NRF24L01_TxPacket(u8 *txbuf)
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
   	NRF24L01_Write_Buf(WR_TX_PLOAD,txbuf,TX_PLOAD_WIDTH);//写数据到TX BUF  32个字节
  	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);//启动发送	   
-	while(HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_6)!=0);//等待发送完成
+	{ uint32_t _t0 = HAL_GetTick();
+	  while(HAL_GPIO_ReadPin(GPIOA,GPIO_PIN_6)!=0){
+	    if(HAL_GetTick() - _t0 > 20u) break;   /* 20ms 超时, IRQ 异常时不死等 */
+	  }
+	}
 	sta=NRF24L01_Read_Reg(STATUS);  //读取状态寄存器的值	   
 	NRF24L01_Write_Reg(NRF_WRITE_REG+STATUS,sta); //清除TX_DS或MAX_RT中断标志
 	if(sta&MAX_TX)//达到最大重发次数
@@ -283,7 +287,9 @@ u8 NRF24L01_RxPacket(u8 *rxbuf)
 	//SPI2_SetSpeed(SPI_BaudRatePrescaler_8); //spi速度为9Mhz（24L01的最大SPI时钟为10Mhz）   
 	sta=NRF24L01_Read_Reg(STATUS);  //读取状态寄存器的值    	 
 	NRF24L01_Write_Reg(NRF_WRITE_REG+STATUS,sta); //清除TX_DS或MAX_RT中断标志
-	if(sta&RX_OK)//接收到数据
+	/* SPI 空读时 MISO 读回 0xFF, 0xFF&RX_OK 恒为真,
+	   必须用 FIFO_STATUS 判空, 否则把空 FIFO 当收包自激 */
+	if((sta&RX_OK) && (NRF24L01_Read_Reg(NRF_FIFO_STATUS)&0x01)==0)//接收到数据
 	{
 		NRF24L01_Read_Buf(RD_RX_PLOAD,rxbuf,RX_PLOAD_WIDTH);//读取数据
 		NRF24L01_Write_Reg(FLUSH_RX,0xff);//清除RX FIFO寄存器 
@@ -314,10 +320,11 @@ void NRF24L01_RX_Mode(void)
 //PWR_UP,CRC使能
 //当CE变高后,即进入RX模式,并可以接收数据了		   
 //CE为高大于10us,则启动发送.	 
+/* Keep CE low through configuration/FIFO flush; TxPacket raises it after loading. */
 void NRF24L01_TX_Mode(void)
 {														 
-	NRF24L01_Write_Reg(NRF_WRITE_REG + CONFIG, 0x00);
 	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);  
+	NRF24L01_Write_Reg(NRF_WRITE_REG + CONFIG, 0x00);
   	NRF24L01_Write_Buf(NRF_WRITE_REG+TX_ADDR,(u8*)TX_ADDRESS,TX_ADR_WIDTH);//写TX节点地址 
   	NRF24L01_Write_Buf(NRF_WRITE_REG+RX_ADDR_P0,(u8*)RX_ADDRESS,RX_ADR_WIDTH); //设置TX节点地址,主要为了使能ACK	  
 
@@ -326,10 +333,10 @@ void NRF24L01_TX_Mode(void)
   	NRF24L01_Write_Reg(NRF_WRITE_REG+SETUP_RETR,0x1a);//设置自动重发间隔时间:500us + 86us;最大自动重发次数:10次
   	NRF24L01_Write_Reg(NRF_WRITE_REG+RF_CH,40);       //设置RF通道为40
   	NRF24L01_Write_Reg(NRF_WRITE_REG+RF_SETUP,0x0f);  //设置TX发射参数,0db增益,2Mbps,低噪声增益开启   
-  	NRF24L01_Write_Reg(NRF_WRITE_REG+CONFIG,0x0e);    //配置基本工作模式的参数;PWR_UP,EN_CRC,16BIT_CRC,接收模式,开启所有中断
-	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);//CE为高,10us后启动发送
     NRF24L01_Write_Reg(FLUSH_TX,0xff);
   NRF24L01_Write_Reg(FLUSH_RX,0xff);
+  	NRF24L01_Write_Reg(NRF_WRITE_REG+CONFIG,0x0e);    //配置基本工作模式的参数;PWR_UP,EN_CRC,16BIT_CRC,接收模式,开启所有中断
+	HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);//CE保持低, 由safe_TxPacket写完FIFO后再拉高
 }
 
 /* USER CODE END 1 */

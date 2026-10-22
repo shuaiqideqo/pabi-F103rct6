@@ -522,6 +522,13 @@ void DUO_Motor_OFF(void){
 #define ADJ_CMD   "ADJ,"        /* 纠偏帧: ADJ,<phi>,<psi>,<ax> (含ADJ,0,0,0使能) */
 #define ADJ_WAIT_MS  180000u    /* 纠偏等待总时限(ms), 超时视为母机失联 */
 #define COOP_IMU_PERIOD_MS  200u
+#define TSTA_CMD  "TSTA"   /* 母->子: 进入视觉纠偏测试 */
+#define TSTB_RSP  "TSTB"   /* 子->母: 测试就绪 */
+#define TSTE_CMD  "TSTE"   /* 母->子: 退出测试 */
+
+static uint8_t g_test_mode = 0;
+static uint8_t g_coop_prefetched = 0;
+static volatile uint8_t g_tsta_pending = 0;   /* 外层收到 TSTA, 待 Test_WaitLoop 消费 */
 
 /* 解析 ADJ, 帧载荷 → 存入 g_adj_* */
 static void Adj_ParseStore(const uint8_t *buf){
@@ -541,18 +548,102 @@ static void Adj_ParseStore(const uint8_t *buf){
 static uint8_t  g_coop_report_en = 0;
 static uint32_t g_imu_last_tx_us = 0;
 
-static void Coop_SendFrame(const char *frame){
+/* ---- NRF safe TX/RX: 有限重试, 避免 IRQ/假阳性导致死循环 ---- */
+volatile uint8_t g_last_tx_status = 0xff;
+volatile uint8_t g_last_tx_fifo = 0xff;
+volatile uint8_t g_last_tx_result = 0xff;
+volatile uint8_t g_last_tx_attempts = 0;
+
+/* 等 TX_DS/MAX_RT 本身, 不能把 RX_DR 拉低的 IRQ 误当成发送结束。 */
+static uint8_t safe_TxPacket(uint8_t *txbuf)
+{
+  uint8_t sta;
+  /* CE 先拉低再清标志: 主固件里 IMU/遥测等路径会留下 RX_DR,
+     若不先清, IRQ(PA6) 已被拉低, 下面等 IRQ 的循环会立即退出,
+     读到的 STATUS 是旧的 RX_DR, 发送根本没启动(实测 STATUS=0x40) */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_RESET);
+  NRF24L01_Write_Reg(NRF_WRITE_REG + STATUS, 0x70);
+  NRF24L01_Write_Reg(FLUSH_TX, 0xFF);
+  NRF24L01_Write_Reg(FLUSH_RX, 0xFF);
+
+  NRF24L01_Write_Buf(WR_TX_PLOAD, txbuf, 32);
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+
+  uint32_t t0 = HAL_GetTick();
+  do {
+    sta = NRF24L01_Read_Reg(STATUS);
+    if (sta == 0xff || (sta & (TX_OK | MAX_TX))) break;
+  } while (HAL_GetTick() - t0 < 20u);
+
+  g_last_tx_status = sta;
+  g_last_tx_fifo = NRF24L01_Read_Reg(NRF_FIFO_STATUS);
+  NRF24L01_Write_Reg(NRF_WRITE_REG + STATUS, sta);
+  if (sta == 0xff) { NRF24L01_Write_Reg(FLUSH_TX, 0xff); return 0xff; }
+  if (sta & MAX_TX) { NRF24L01_Write_Reg(FLUSH_TX, 0xFF); return MAX_TX; }
+  if (sta & TX_OK)  { return TX_OK; }
+  NRF24L01_Write_Reg(FLUSH_TX, 0xff); /* 超时重试前移除未决 payload */
+  return 0xFF;
+}
+
+/* 可靠收包: IRQ 引脚判据 + FIFO_STATUS 判空, 避免 SPI 空读假阳性 */
+static uint8_t safe_RxPacket(uint8_t *rxbuf)
+{
+  if (HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_6) != 0) return 1;
+  uint8_t sta = NRF24L01_Read_Reg(STATUS);
+  NRF24L01_Write_Reg(NRF_WRITE_REG + STATUS, sta);
+  if ((sta & RX_OK) == 0) return 1;
+  uint8_t fifo = NRF24L01_Read_Reg(NRF_FIFO_STATUS);
+  if (fifo & 0x01) { NRF24L01_Write_Reg(FLUSH_RX, 0xFF); return 1; }
+  NRF24L01_Read_Buf(RD_RX_PLOAD, rxbuf, 32);
+  NRF24L01_Write_Reg(FLUSH_RX, 0xFF);
+  return 0;
+}
+
+/* 发送任意长度载荷(<=32); 有限重试, 避免对端不在时死循环 */
+static uint8_t Coop_SendRaw(const uint8_t *data, uint8_t len, uint8_t retries){
   uint8_t buf[32] = {0};
-  uint8_t i;
-  for(i = 0; i < 4; i++) buf[i] = (uint8_t)frame[i];
+  uint8_t n = 0;
+  if(len > 32) len = 32;
+  memcpy(buf, data, len);
   NRF24L01_TX_Mode();
   HAL_Delay(2);
-  while(NRF24L01_TxPacket(buf) != TX_OK){
-    printf("send %s fail, retry\r\n", frame);
+  while(safe_TxPacket(buf) != TX_OK){
+    if(++n >= retries){
+      g_last_tx_attempts = n;
+      g_last_tx_result = 1;
+      NRF24L01_RX_Mode();
+      return 1;
+    }
     HAL_Delay(2);
   }
-  printf("%s sent\r\n", frame);
+  g_last_tx_attempts = n + 1;
+  g_last_tx_result = 0;
   NRF24L01_RX_Mode();
+  return 0;
+}
+
+static void Coop_SendFrame(const char *frame){
+  uint8_t buf[32] = {0};
+  size_t len = strlen(frame);
+  if(len > 32) len = 32;
+  memcpy(buf, frame, len);
+  if(Coop_SendRaw(buf, 32, 20) == 0) printf("%s sent\r\n", frame);
+  else                               printf("%s send fail\r\n", frame);
+}
+
+/* 轮子运动遥测帧 'J' (11 字节), 母机原样转发 App */
+static void Test_Telem(uint8_t stage, int8_t dir, int16_t a_mm, int16_t b_mm,
+                       int16_t target_mm, uint8_t pct, uint8_t rc){
+  uint8_t f[11];
+  f[0] = 'J';
+  f[1] = stage;
+  f[2] = (uint8_t)dir;
+  memcpy(&f[3], &a_mm, 2);
+  memcpy(&f[5], &b_mm, 2);
+  memcpy(&f[7], &target_mm, 2);
+  f[9]  = pct;
+  f[10] = rc;
+  (void)Coop_SendRaw(f, sizeof(f), 2);
 }
 
 static uint8_t Coop_FindFrame(const uint8_t *buf, const char *frame){
@@ -570,7 +661,8 @@ static uint8_t Coop_IsProtoFrame(const uint8_t *buf){
   return (uint8_t)(Coop_FindFrame(buf, COOP_CMD) || Coop_FindFrame(buf, GOON_CMD) ||
                    Coop_FindFrame(buf, LOCK_CMD) || Coop_FindFrame(buf, STOP_CMD) ||
                    Coop_FindFrame(buf, REDY_RSP) || Coop_FindFrame(buf, DONE_RSP) ||
-                   Coop_FindFrame(buf, ACKD_RSP) || Coop_FindFrame(buf, ADJ_CMD));
+                   Coop_FindFrame(buf, ACKD_RSP) || Coop_FindFrame(buf, ADJ_CMD) ||
+                   Coop_FindFrame(buf, TSTA_CMD) || Coop_FindFrame(buf, TSTE_CMD));
 }
 
 /* 1=中止并写入 Arr_RX; STOP 清摇杆, 遥控帧原样拷贝 */
@@ -597,7 +689,7 @@ static uint8_t Coop_TakeAbort(const uint8_t *buf){
 
 static uint8_t Coop_PollAbort(void){
   uint8_t buf[32];
-  if(NRF24L01_RxPacket(buf) != 0) return 0;
+  if(safe_RxPacket(buf) != 0) return 0;
   return Coop_TakeAbort(buf);
 }
 
@@ -605,7 +697,7 @@ static uint8_t Coop_WaitFrame(const char *frame){
   uint8_t buf[32];
   NRF24L01_Write_Reg(FLUSH_RX, 0xff);
   while(1){
-    if(NRF24L01_RxPacket(buf) == 0){
+    if(safe_RxPacket(buf) == 0){
       if(Coop_FindFrame(buf, frame)){
         printf("%s received\r\n", frame);
         return 0;
@@ -628,7 +720,7 @@ static void Coop_ReportIMU(void){
   memcpy(&buf[5], &roll, 4);
   NRF24L01_TX_Mode();
   HAL_Delay(2);
-  (void)NRF24L01_TxPacket(buf);
+  (void)safe_TxPacket(buf);
   NRF24L01_RX_Mode();
 }
 
@@ -780,8 +872,13 @@ void AUTO(void){
     DUO_Motor_OFF();
     g_coop_report_en = 0;
     g_adj_armed = 0;   /* 新周期: 重置纠偏武装, 母机发ADJ帧再使能 */
-    printf("AUTO ready, wait COOP...\r\n");
-    if(Coop_WaitFrame(COOP_CMD)) return;
+    if(g_coop_prefetched){
+      g_coop_prefetched = 0;
+      printf("AUTO start (COOP prefetched)\r\n");
+    } else {
+      printf("AUTO ready, wait COOP...\r\n");
+      if(Coop_WaitFrame(COOP_CMD)) return;
+    }
 
     g_coop_report_en = 1;
     g_imu_last_tx_us = 0;
@@ -849,11 +946,10 @@ uint32_t Flash_ReadNUM[2] = {0};
  * 每个子动作: 轮速PID慢速 + 编码器里程计计数到量即停 + 超时 + 每10ms轮询中止
  * 返回: 0=完成 1=被中止(STOP/遥控) 2=超时/打滑 */
 #define ADJ_PI              3.14159265f
-#define ADJ_SPEED_REV       8.0f     /* 纠偏行驶速度(电机轴转/s), 慢速保证附着 */
-#define ADJ_MM_PER_MOTORREV 15.0f    /* ⚠️占位待标定: 里程计每"电机转"对应轮面行走毫米
-                                     标定: 跑一段已知指令, 卷尺量实际距离, 按比例修此值 */
+#define ADJ_SPEED_REV       80.0f    /* 纠偏速度(电机轴转/s). kp*err=18*80≈1440→占空比~34%; 8.0时仅~3%低于静摩擦,轮不动A=B=0 */
+#define ADJ_MM_PER_MOTORREV 0.3555f /* 里程计 mm/电机轴转: π×轮径43 / 减速比380; 卷尺复核可再微调 */
 #define ADJ_TRACK_MM        100.0f   /* ⚠️占位待标定: 两驱动轮接触点间距(mm) */
-#define ADJ_PIPE_R_MM       60.0f    /* ⚠️占位待标定: 管道外半径(mm), φ→弧长换算 */
+#define ADJ_PIPE_R_MM       250.0f   /* 管道外半径(mm): 用户指定 R=250 (直径约50cm) */
 #define ADJ_DIAG_BETA_DEG   30.0f    /* 轴向斜行定角(deg), 最大自旋=2×β */
 #define ADJ_MV_SIGN         (+1)     /* 标定: φ>0 时应往哪边走(+1=下降方向) */
 #define ADJ_SPIN_SIGN       (+1)     /* 标定: ψ>0 时应往哪边转(+1=S+方向) */
@@ -861,12 +957,23 @@ uint32_t Flash_ReadNUM[2] = {0};
 #define ADJ_TOL_PHI         0.5f     /* 死区(deg) */
 #define ADJ_TOL_PSI         0.5f
 #define ADJ_TOL_AX          2.0f     /* 死区(mm), 以内交给夹爪容差 */
-#define ADJ_MAX_PHI         10.0f    /* 单次限幅(deg), 超限钳位, 视觉下一轮再补 */
-#define ADJ_MAX_PSI         10.0f
-#define ADJ_MAX_AX          30.0f    /* 单次限幅(mm) */
+#define ADJ_MAX_PHI         10.0f    /* 历史限幅常量(现已不钳位, 仅留作参考) */
+#define ADJ_MAX_PSI         10.0f    /* 历史限幅常量(现已不钳位) */
+#define ADJ_MAX_AX          30.0f    /* 历史限幅常量(现已不钳位) */
 #define ADJ_SETTLE_MS       150      /* 段间刹车稳定等待 */
-#define ADJ_SLIP_DIFF_MM    8.0f     /* 直行两轮里程差超此值判打滑 */
+#define ADJ_DEMO_GAIN       1.0f     /* 调试放大 phi/psi; 默认1=真实角度, 调试可改5 */
+#define ADJ_SLIP_DIFF_MM    50.0f    /* 历史打滑门限; Adj_Move 打滑检测已按用户要求去掉, 此宏暂保留不用 */
 #define ADJ_SELF_TEST       1        /* 1=作业模式下 key8 触发一次演示纠偏 */
+#define ADJ_ST_AXIAL        1
+#define ADJ_ST_SPIN         2
+#define ADJ_ST_MOVE         3
+#define ADJ_ST_SETTLE       4
+#define ADJ_TEL_PERIOD_MS   500u     /* 运动遥测周期(ms) */
+/* 周向 φ 开环定时: 代码保留, 默认关闭; 改1后走 Adj_MoveTimed */
+#define ADJ_MOVE_TIMED      0
+#define ADJ_MOVE_SPEED_REV  15.0f    /* 开环直行速度(电机转/s) */
+#define ADJ_MOVE_MIN_MS     600u
+#define ADJ_MOVE_MAX_MS     5000u
 #define ADJ_TEST_PHI        5.0f     /* 自检演示值(配合占位常数观察动作方向) */
 #define ADJ_TEST_PSI        (-3.0f)
 #define ADJ_TEST_AX         10.0f
@@ -900,51 +1007,132 @@ static uint8_t Adj_Settle(void){
   }
   return 0;
 }
-/* 直行 dist_mm: >0=下降方向(A CH1/B CH4) <0=上升方向(A CH2/B CH3)
- * 返回 0=完成 1=中止 2=超时/打滑 */
+/* 直行 dist_mm: >0=下降向 <0=上升向
+ * 轮令改回更早规则: A/B 异号(物理同向). 返回 0=完成 1=中止 2=超时/打滑 */
 static uint8_t Adj_Move(float dist_mm){
   ADJ_ODOM_T od;
   float target = fabsf(dist_mm);
   float v = ADJ_SPEED_REV;
-  uint32_t t_to = (uint32_t)(target / (ADJ_SPEED_REV * ADJ_MM_PER_MOTORREV) * 1500.0f) + 800u;
+  /* 超时兜底: 常数未标定前理论时限不可靠, 放宽为 20x + 20s (对齐 wallbot) */
+  uint32_t t_to = (uint32_t)(target / (ADJ_SPEED_REV * ADJ_MM_PER_MOTORREV) * 20000.0f) + 20000u;
   uint32_t t0 = HAL_GetTick();
+  uint32_t t_tel = 0;
+  int8_t dir = (dist_mm > 0) ? 1 : -1;
   if(target < 0.5f) return 0;
   Adj_OdomStart(&od);
   while(1){
+    /* 改回更早轮向: 直行 A/B 异号 → 物理同向周移 */
     if(dist_mm > 0){ PID_MA(+v); PID_MB(-v); }
     else           { PID_MA(-v); PID_MB(+v); }
     HAL_Delay(10);
     Adj_OdomUpdate(&od);
-    if((fabsf(od.a_mm) + fabsf(od.b_mm)) * 0.5f >= target) break;
-    if(fabsf(fabsf(od.a_mm) - fabsf(od.b_mm)) > ADJ_SLIP_DIFF_MM){
-      motor_STOP(); printf("ADJ move slip A=%d B=%d\r\n", (int)od.a_mm, (int)od.b_mm); return 2;
+    {
+      float done = (fabsf(od.a_mm) + fabsf(od.b_mm)) * 0.5f;
+      if(HAL_GetTick() - t_tel >= ADJ_TEL_PERIOD_MS){
+        uint8_t pct = (target > 0.01f) ? (uint8_t)(done * 100.0f / target) : 0;
+        if(pct > 100) pct = 100;
+        t_tel = HAL_GetTick();
+        Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm,
+                   (int16_t)target, pct, 0);
+      }
+      if(done >= target) break;
     }
-    if(HAL_GetTick() - t0 > t_to){ motor_STOP(); printf("ADJ move timeout\r\n"); return 2; }
-    if(Coop_PollAbort()){ motor_STOP(); return 1; }
+    if(HAL_GetTick() - t0 > t_to){
+      motor_STOP();
+      Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 3);
+      printf("ADJ move timeout\r\n"); return 2;
+    }
+    if(Coop_PollAbort()){
+      motor_STOP();
+      Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 2);
+      return 1;
+    }
   }
   motor_STOP();
+  Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 1);
   printf("ADJ move %dmm ok (A=%d B=%d)\r\n", (int)target, (int)od.a_mm, (int)od.b_mm);
   return 0;
 }
-/* 原地旋转 theta_deg: >0=S+方向(A上升/B下降), <0=S-; 返回同上 */
+/* 测试用开环定时直行(默认 ADJ_MOVE_TIMED=0 不启用)。极性与 Adj_Move 一致: 异号=物理同向 */
+static uint8_t Adj_MoveTimed(float dist_mm){
+  ADJ_ODOM_T od;
+  float    dir    = (dist_mm > 0.0f) ? +1.0f : -1.0f;
+  float    target = fabsf(dist_mm);
+  float    v      = ADJ_MOVE_SPEED_REV;
+  uint32_t dur_ms, t0, t_tel = 0;
+  if(target < 0.5f) return 0;
+  dur_ms = (uint32_t)(target / (v * ADJ_MM_PER_MOTORREV) * 1000.0f);
+  if(dur_ms < ADJ_MOVE_MIN_MS) dur_ms = ADJ_MOVE_MIN_MS;
+  if(dur_ms > ADJ_MOVE_MAX_MS) dur_ms = ADJ_MOVE_MAX_MS;
+  printf("ADJ movetimed dir=%d v=%d dist=%dmm dur=%lums\r\n", (int)dir, (int)v, (int)target, (unsigned long)dur_ms);
+  Adj_OdomStart(&od);
+  t0 = HAL_GetTick();
+  while(HAL_GetTick() - t0 < dur_ms){
+    PID_MA( dir * v);
+    PID_MB(-dir * v);   /* 异号=物理同向, 与 Adj_Move 一致 */
+    HAL_Delay(10);
+    Adj_OdomUpdate(&od);
+    if(HAL_GetTick() - t_tel >= ADJ_TEL_PERIOD_MS){
+      uint32_t el = HAL_GetTick() - t0;
+      uint8_t  pct = (uint8_t)(el * 100u / dur_ms);
+      if(pct > 100) pct = 100;
+      t_tel = HAL_GetTick();
+      Test_Telem(ADJ_ST_MOVE, (int8_t)dir, (int16_t)od.a_mm, (int16_t)od.b_mm,
+                 (int16_t)target, pct, 0);
+    }
+    if(Coop_PollAbort()){
+      motor_STOP();
+      Test_Telem(ADJ_ST_MOVE, (int8_t)dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 2);
+      return 1;
+    }
+  }
+  motor_STOP();
+  Test_Telem(ADJ_ST_MOVE, (int8_t)dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 1);
+  printf("ADJ movetimed ok %lums A=%d B=%d\r\n", (unsigned long)dur_ms, (int)od.a_mm, (int)od.b_mm);
+  return 0;
+}
+/* 原地旋转 theta_deg: >0=S+ <0=S-; 返回同上
+ * 轮令改回更早规则: A/B 同号(物理对转自旋) */
 static uint8_t Adj_Spin(float theta_deg){
   ADJ_ODOM_T od;
   float arc = fabsf(theta_deg) * ADJ_PI / 180.0f * (ADJ_TRACK_MM * 0.5f);
   float v = ADJ_SPEED_REV;
-  uint32_t t_to = (uint32_t)(arc / (ADJ_SPEED_REV * ADJ_MM_PER_MOTORREV) * 1500.0f) + 800u;
+  uint32_t t_to = (uint32_t)(arc / (ADJ_SPEED_REV * ADJ_MM_PER_MOTORREV) * 20000.0f) + 20000u;
   uint32_t t0 = HAL_GetTick();
+  uint32_t t_tel = 0;
+  int8_t dir = (theta_deg * (float)ADJ_SPIN_SIGN > 0) ? 1 : -1;
   if(arc < 0.5f) return 0;
   Adj_OdomStart(&od);
   while(1){
-    if(theta_deg * (float)ADJ_SPIN_SIGN > 0){ PID_MA(-v); PID_MB(-v); }  /* S+: A上升 B下降 */
-    else                                     { PID_MA(+v); PID_MB(+v); } /* S-: A下降 B上升 */
+    /* 改回更早轮向: 自旋 A/B 同号 → 物理对转; 方向仍可用 ADJ_SPIN_SIGN */
+    if(theta_deg * (float)ADJ_SPIN_SIGN > 0){ PID_MA(-v); PID_MB(-v); }  /* S+: A/B 同号 */
+    else                                     { PID_MA(+v); PID_MB(+v); } /* S-: A/B 同号 */
     HAL_Delay(10);
     Adj_OdomUpdate(&od);
-    if((fabsf(od.a_mm) + fabsf(od.b_mm)) * 0.5f >= arc) break;
-    if(HAL_GetTick() - t0 > t_to){ motor_STOP(); printf("ADJ spin timeout\r\n"); return 2; }
-    if(Coop_PollAbort()){ motor_STOP(); return 1; }
+    {
+      float done = (fabsf(od.a_mm) + fabsf(od.b_mm)) * 0.5f;
+      if(HAL_GetTick() - t_tel >= ADJ_TEL_PERIOD_MS){
+        uint8_t pct = (arc > 0.01f) ? (uint8_t)(done * 100.0f / arc) : 0;
+        if(pct > 100) pct = 100;
+        t_tel = HAL_GetTick();
+        Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm,
+                   (int16_t)arc, pct, 0);
+      }
+      if(done >= arc) break;
+    }
+    if(HAL_GetTick() - t0 > t_to){
+      motor_STOP();
+      Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)arc, 100, 3);
+      printf("ADJ spin timeout\r\n"); return 2;
+    }
+    if(Coop_PollAbort()){
+      motor_STOP();
+      Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)arc, 100, 2);
+      return 1;
+    }
   }
   motor_STOP();
+  Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)arc, 100, 1);
   printf("ADJ spin %ddeg ok\r\n", (int)theta_deg);
   return 0;
 }
@@ -968,9 +1156,10 @@ static uint8_t Adj_Axial(float ax_mm){
 }
 /* 规划器入口: 三个偏差量 → 全部纠偏运动; 返回 0完成 1中止 2出错 */
 uint8_t Adj_Execute(float phi_deg, float psi_deg, float ax_mm){
-  float phi = Adj_Clamp(phi_deg, ADJ_MAX_PHI);
-  float psi = Adj_Clamp(psi_deg, ADJ_MAX_PSI);
-  float ax  = Adj_Clamp(ax_mm,  ADJ_MAX_AX);
+  /* 限幅已按用户要求去掉: 视觉/测试给多少就按多少执行(仍保留死区) */
+  float phi = phi_deg * ADJ_DEMO_GAIN;
+  float psi = psi_deg * ADJ_DEMO_GAIN;
+  float ax  = ax_mm;
   uint8_t rc = 0;
   Clear_All_PID();
   if(fabsf(phi) < ADJ_TOL_PHI) phi = 0;
@@ -981,7 +1170,15 @@ uint8_t Adj_Execute(float phi_deg, float psi_deg, float ax_mm){
   if(Adj_Settle()){ rc = 1; goto out; }
   if(psi != 0){ rc = Adj_Spin(-psi * (float)ADJ_SPIN_SIGN); if(rc) goto out; }
   if(Adj_Settle()){ rc = 1; goto out; }
-  if(phi != 0){ rc = Adj_Move(phi * ADJ_PI / 180.0f * ADJ_PIPE_R_MM * (float)ADJ_MV_SIGN); if(rc) goto out; }
+  if(phi != 0){
+    float dphi = phi * ADJ_PI / 180.0f * ADJ_PIPE_R_MM * (float)ADJ_MV_SIGN;
+#if ADJ_MOVE_TIMED
+    rc = Adj_MoveTimed(dphi);
+#else
+    rc = Adj_Move(dphi);
+#endif
+    if(rc) goto out;
+  }
 out:
   motor_STOP();
   printf("ADJ finish rc=%u\r\n", rc);
@@ -998,7 +1195,7 @@ static uint8_t Adj_WaitLoop(void){
   while(1){
     uint8_t buf[32];
     Coop_ReportIMU();
-    if(NRF24L01_RxPacket(buf) == 0){
+    if(safe_RxPacket(buf) == 0){
       if(Coop_FindFrame(buf, GOON_CMD)){
         printf("ADJ aligned\r\n");
         return 0;                                   /* 对齐: 调用方发DONE */
@@ -1022,6 +1219,77 @@ static uint8_t Adj_WaitLoop(void){
     }
   }
 }
+/* ============ 视觉纠偏测试模式 (地面调试, 不开风机) ============
+ * 母->子: TSTA 进入 / ADJ,<phi>,<psi>,<ax> / TSTE 退出 / STOP 中止
+ * 子->母: TSTB 就绪 / DONE 本轮完毕 / 'J' 遥测
+ * 返回: 0=未进入(主循环跑 AUTO) 1=测试已退出
+ * 正常 COOP 帧被预取, 交给 AUTO() 继续 */
+static uint8_t Test_WaitLoop(void){
+  uint8_t buf[32];
+  if(!g_tsta_pending){
+  printf("TEST wait: TSTA for test, COOP for AUTO\r\n");
+  NRF24L01_Write_Reg(FLUSH_RX, 0xff);
+  while(1){
+    if(safe_RxPacket(buf) == 0){
+      if(Coop_FindFrame(buf, TSTA_CMD)){
+        printf("TSTA received, enter test\r\n");
+        break;
+      }
+      if(Coop_FindFrame(buf, COOP_CMD)){
+        printf("COOP received, run AUTO\r\n");
+        g_coop_prefetched = 1;
+        return 0;
+      }
+      if(Coop_TakeAbort(buf)){
+        printf("TEST abort before start\r\n");
+        return 0;
+      }
+    }
+  }
+  }
+
+  g_tsta_pending = 0;
+  g_test_mode = 1;
+  Coop_SendFrame(TSTB_RSP);
+  NRF24L01_Write_Reg(FLUSH_RX, 0xff);
+
+  while(1){
+    if(safe_RxPacket(buf) == 0){
+      if(Coop_FindFrame(buf, TSTA_CMD)){
+        Coop_SendFrame(TSTB_RSP);
+        continue;
+      }
+      if(Coop_FindFrame(buf, TSTE_CMD)){
+        printf("TSTE received, exit test\r\n");
+        g_test_mode = 0;
+        motor_STOP();
+        return 1;
+      }
+      if(Coop_FindFrame(buf, ADJ_CMD)){
+        uint8_t rc;
+        Adj_ParseStore(buf);
+        printf("TEST ADJ phi=%d psi=%d ax=%d\r\n",
+               (int)g_adj_phi, (int)g_adj_psi, (int)g_adj_ax);
+        rc = Adj_Execute(g_adj_phi, g_adj_psi, g_adj_ax);
+        if(rc == 1){
+          printf("TEST exec aborted\r\n");
+          g_test_mode = 0;
+          return 1;
+        }
+        Coop_SendFrame(DONE_RSP);
+        NRF24L01_Write_Reg(FLUSH_RX, 0xff);
+        continue;
+      }
+      if(Coop_TakeAbort(buf)){
+        printf("TEST abort\r\n");
+        g_test_mode = 0;
+        motor_STOP();
+        return 1;
+      }
+    }
+  }
+}
+
 static void ApplyRemoteKey(int8_t key){
   if(key == 0) return;
   if(MODE == 11){
@@ -1230,7 +1498,30 @@ int main(void)
   {
     if(PI_LINK_EN) Pi_CMD_Process();   /* 处理树莓派串口指令(PI_LINK_EN=0时停用) */
 
-    if(NRF24L01_RxPacket((uint8_t *)Arr_RX)==0){
+    /* AUTO/测试模式: 接收由 Test_WaitLoop/AUTO 内部独占, 外层不得抢 RX FIFO */
+    if(MODE == 10){
+      if(Test_WaitLoop() == 0){
+        AUTO();
+      }
+      /* 中止退出: 保持吸力, 切手操; key=6 在此停风机 */
+      MODE = 9;
+      g_coop_report_en = 0;
+      motor_STOP();
+      if(Arr_RX[5] != 0){
+        ApplyRemoteKey(Arr_RX[5]);
+        Arr_RX[5] = 0;
+      }
+      continue;
+    }
+
+    if(safe_RxPacket((uint8_t *)Arr_RX)==0){
+        /* 手动模式下收到 TSTA: 请求进入测试 */
+        if(Coop_FindFrame((const uint8_t *)Arr_RX, TSTA_CMD)){
+          g_tsta_pending = 1;
+          MODE = 10;
+          memset(Arr_RX, 0, 32);
+          continue;
+        }
         if(Arr_RX[5] != 0){
           ApplyRemoteKey(Arr_RX[5]);
           Arr_RX[5] = 0;
@@ -1250,17 +1541,6 @@ int main(void)
         }
     }
 
-    if(MODE == 10){
-      AUTO();
-      /* 中止退出: 保持吸力, 切手操; key=6 在此停风机 */
-      MODE = 9;
-      g_coop_report_en = 0;
-      motor_STOP();
-      if(Arr_RX[5] != 0){
-        ApplyRemoteKey(Arr_RX[5]);
-        Arr_RX[5] = 0;
-      }
-    }
   }
 
   
