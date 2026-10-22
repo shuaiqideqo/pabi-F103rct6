@@ -29,3 +29,7 @@ _git_init.bat
 _git_out.txt
 _git_commit.bat
 _commit_msg.txt
+
+# 整包备份压缩包
+pabi_F103rct6.zip
+*.zip

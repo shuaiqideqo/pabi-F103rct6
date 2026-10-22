@@ -1040,7 +1040,7 @@ static void ApplyRemoteKey(int8_t key){
       DUO_Motor_SET(1);
       printf("SERVO down %d\r\n", (int)DUO_PWM_SET);
     } else if(key == 2){
-      /* 抬升: 一点一点往上(每按-142) */
+      /* 抬升: 一点一点往上(每按-142), 下限499(舵机规格) */
       DUO_Motor_SET(2);
       printf("SERVO up %d\r\n", (int)DUO_PWM_SET);
     } else if(key == 3 || key == 4 || key == 6){
