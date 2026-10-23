@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -31,6 +31,7 @@
 /* USER CODE BEGIN Includes */
 #include <string.h>
 #include <stdlib.h>             /* atoi: 树莓派PWM设定指令 */
+#include <stdio.h>              /* snprintf: 组无线日志帧 */
 //GIS? 552g 60% 7.6V ok ??500g?472g ????80? ?? ?
 /* USER CODE END Includes */
 
@@ -632,6 +633,19 @@ static void Coop_SendFrame(const char *frame){
 }
 
 /* 轮子运动遥测帧 'J' (11 字节), 母机原样转发 App */
+/* 子机日志帧 'L': [0]='L' [1]=长度 [2..] 文本.
+ * 子机 printf 无 _write 重定向(nosys.specs), 日志只能经 NRF 送回母机打印到串口.
+ * 只在段边界/遥测周期调用, 不进 10ms 控制环 */
+static void Adj_Log(const char *msg){
+  uint8_t f[32];
+  size_t n = strlen(msg);
+  if(n > 30) n = 30;
+  f[0] = 'L';
+  f[1] = (uint8_t)n;
+  memcpy(&f[2], msg, n);
+  (void)Coop_SendRaw(f, (uint8_t)(n + 2), 2);
+}
+
 static void Test_Telem(uint8_t stage, int8_t dir, int16_t a_mm, int16_t b_mm,
                        int16_t target_mm, uint8_t pct, uint8_t rc){
   uint8_t f[11];
@@ -948,12 +962,15 @@ uint32_t Flash_ReadNUM[2] = {0};
 #define ADJ_PI              3.14159265f
 #define ADJ_SPEED_REV       80.0f    /* 纠偏速度(电机轴转/s). kp*err=18*80≈1440→占空比~34%; 8.0时仅~3%低于静摩擦,轮不动A=B=0 */
 #define ADJ_MM_PER_MOTORREV 0.3555f /* 里程计 mm/电机轴转: π×轮径43 / 减速比380; 卷尺复核可再微调 */
-#define ADJ_TRACK_MM        100.0f   /* ⚠️占位待标定: 两驱动轮接触点间距(mm) */
+#define ADJ_TRACK_MM        145.0f   /* wheel track mm (measured 145) */
 #define ADJ_PIPE_R_MM       250.0f   /* 管道外半径(mm): 用户指定 R=250 (直径约50cm) */
-#define ADJ_DIAG_BETA_DEG   30.0f    /* 轴向斜行定角(deg), 最大自旋=2×β */
+#define ADJ_DIAG_BETA_DEG   20.0f    /* 轴向斜行定角(deg), 最大自旋=2×β */
 #define ADJ_MV_SIGN         (+1)     /* 标定: φ>0 时应往哪边走(+1=下降方向) */
 #define ADJ_SPIN_SIGN       (+1)     /* 标定: ψ>0 时应往哪边转(+1=S+方向) */
 #define ADJ_AXIAL_SIGN      (+1)     /* 标定: S+歪头后前进, 轴向分量朝哪边(+1=+ax侧) */
+/* 轴向斜行经验系数: 理论 L=|ax|/sinβ, d=|ax|/tanβ; 按实测日志拟合后按比例修此值 */
+#define ADJ_AXIAL_L_K       1.0f     /* 斜行距离 L 的倍率 */
+#define ADJ_AXIAL_D_K       1.0f     /* 周向补偿 d 的倍率 */
 #define ADJ_TOL_PHI         0.5f     /* 死区(deg) */
 #define ADJ_TOL_PSI         0.5f
 #define ADJ_TOL_AX          2.0f     /* 死区(mm), 以内交给夹爪容差 */
@@ -980,6 +997,10 @@ uint32_t Flash_ReadNUM[2] = {0};
 
 typedef struct { uint16_t a_old, b_old; float a_mm, b_mm; } ADJ_ODOM_T;
 
+/* 最近一次 Adj_Move / Adj_Spin 的实测里程(带符号), 供轴向经验公式拟合 */
+static volatile float g_adj_last_mm  = 0.0f;
+static volatile float g_adj_last_arc = 0.0f;
+
 static float Adj_Clamp(float v, float lim){
   if(v >  lim) return  lim;
   if(v < -lim) return -lim;
@@ -1001,6 +1022,14 @@ static void Adj_OdomUpdate(ADJ_ODOM_T *o){
 static uint8_t Adj_Settle(void){
   uint32_t t0 = HAL_GetTick();
   motor_STOP();
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "stl i%d/%d", (int)err_MA, (int)err_MB);
+    Adj_Log(lb);
+  }
+  /* 清积分: 上一段(尤其自旋)积累的积分若与下一段指令同向, 起步会猛冲 2 倍稳态速度;
+   * 轴向多段斜行逐段累积会更严重, 必须在每段之间清零 */
+  Clear_All_PID();
   while(HAL_GetTick() - t0 < ADJ_SETTLE_MS){
     if(Coop_PollAbort()) return 1;
     HAL_Delay(10);
@@ -1020,6 +1049,14 @@ static uint8_t Adj_Move(float dist_mm){
   int8_t dir = (dist_mm > 0) ? 1 : -1;
   if(target < 0.5f) return 0;
   Adj_OdomStart(&od);
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "mvgo t%d n%d to%d",
+             (int)target,
+             (int)(target / ADJ_MM_PER_MOTORREV * 7.0f),
+             (int)(t_to / 1000u));
+    Adj_Log(lb);
+  }
   while(1){
     /* 改回更早轮向: 直行 A/B 异号 → 物理同向周移 */
     if(dist_mm > 0){ PID_MA(+v); PID_MB(-v); }
@@ -1032,6 +1069,13 @@ static uint8_t Adj_Move(float dist_mm){
         uint8_t pct = (target > 0.01f) ? (uint8_t)(done * 100.0f / target) : 0;
         if(pct > 100) pct = 100;
         t_tel = HAL_GetTick();
+        {
+          char lb[52];
+          snprintf(lb, sizeof(lb), "mv A%d B%d p%d w%d/%d",
+                   (int)od.a_mm, (int)od.b_mm, (int)pct,
+                   (int)g_wheel_va, (int)g_wheel_vb);
+          Adj_Log(lb);
+        }
         Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm,
                    (int16_t)target, pct, 0);
       }
@@ -1040,7 +1084,14 @@ static uint8_t Adj_Move(float dist_mm){
     if(HAL_GetTick() - t0 > t_to){
       motor_STOP();
       Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 3);
-      printf("ADJ move timeout\r\n"); return 2;
+      {
+        char lb[52];
+        snprintf(lb, sizeof(lb), "mvTO t%d A%d B%d e%d",
+                 (int)target, (int)od.a_mm, (int)od.b_mm,
+                 (int)((HAL_GetTick()-t0)/1000u));
+        Adj_Log(lb);
+      }
+      return 2;
     }
     if(Coop_PollAbort()){
       motor_STOP();
@@ -1050,7 +1101,14 @@ static uint8_t Adj_Move(float dist_mm){
   }
   motor_STOP();
   Test_Telem(ADJ_ST_MOVE, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)target, 100, 1);
-  printf("ADJ move %dmm ok (A=%d B=%d)\r\n", (int)target, (int)od.a_mm, (int)od.b_mm);
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "move ok d%d A%d B%d",
+             (int)dist_mm, (int)od.a_mm, (int)od.b_mm);
+    Adj_Log(lb);
+  }
+  /* 记录带指令方向的实际推进量, 供轴向经验公式拟合 */
+  g_adj_last_mm = (float)dir * (fabsf(od.a_mm) + fabsf(od.b_mm)) * 0.5f;
   return 0;
 }
 /* 测试用开环定时直行(默认 ADJ_MOVE_TIMED=0 不启用)。极性与 Adj_Move 一致: 异号=物理同向 */
@@ -1103,6 +1161,14 @@ static uint8_t Adj_Spin(float theta_deg){
   int8_t dir = (theta_deg * (float)ADJ_SPIN_SIGN > 0) ? 1 : -1;
   if(arc < 0.5f) return 0;
   Adj_OdomStart(&od);
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "spgo a%d n%d to%d",
+             (int)arc,
+             (int)(arc / ADJ_MM_PER_MOTORREV * 7.0f),
+             (int)(t_to / 1000u));
+    Adj_Log(lb);
+  }
   while(1){
     /* 改回更早轮向: 自旋 A/B 同号 → 物理对转; 方向仍可用 ADJ_SPIN_SIGN */
     if(theta_deg * (float)ADJ_SPIN_SIGN > 0){ PID_MA(-v); PID_MB(-v); }  /* S+: A/B 同号 */
@@ -1115,6 +1181,13 @@ static uint8_t Adj_Spin(float theta_deg){
         uint8_t pct = (arc > 0.01f) ? (uint8_t)(done * 100.0f / arc) : 0;
         if(pct > 100) pct = 100;
         t_tel = HAL_GetTick();
+        {
+          char lb[52];
+          snprintf(lb, sizeof(lb), "sp A%d B%d p%d w%d/%d",
+                   (int)od.a_mm, (int)od.b_mm, (int)pct,
+                   (int)g_wheel_va, (int)g_wheel_vb);
+          Adj_Log(lb);
+        }
         Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm,
                    (int16_t)arc, pct, 0);
       }
@@ -1123,7 +1196,15 @@ static uint8_t Adj_Spin(float theta_deg){
     if(HAL_GetTick() - t0 > t_to){
       motor_STOP();
       Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)arc, 100, 3);
-      printf("ADJ spin timeout\r\n"); return 2;
+      {
+        char lb[52];
+        snprintf(lb, sizeof(lb), "spTO A%d B%d p%d e%d",
+                 (int)od.a_mm, (int)od.b_mm,
+                 (int)((arc > 0.01f) ? ((fabsf(od.a_mm)+fabsf(od.b_mm))*50.0f/arc) : 0),
+                 (int)((HAL_GetTick()-t0)/1000u));
+        Adj_Log(lb);
+      }
+      return 2;
     }
     if(Coop_PollAbort()){
       motor_STOP();
@@ -1133,55 +1214,193 @@ static uint8_t Adj_Spin(float theta_deg){
   }
   motor_STOP();
   Test_Telem(ADJ_ST_SPIN, dir, (int16_t)od.a_mm, (int16_t)od.b_mm, (int16_t)arc, 100, 1);
-  printf("ADJ spin %ddeg ok\r\n", (int)theta_deg);
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "spin ok t%d a%d A%d B%d",
+             (int)theta_deg, (int)arc, (int)od.a_mm, (int)od.b_mm);
+    Adj_Log(lb);
+  }
+  /* 记录带指令方向的实际弧长, 供轴向经验公式拟合 */
+  g_adj_last_arc = (float)dir * (fabsf(od.a_mm) + fabsf(od.b_mm)) * 0.5f;
   return 0;
 }
 /* 轴向斜行修正: 转+β斜下去(进L) → 转−β摆正 → 退回(直行d)
  * 几何: L=|ax|/sinβ, d=|ax|/tanβ → 净位移=纯轴向ax, 朝向回正, 周向归零 */
 static uint8_t Adj_Axial(float ax_mm){
   float beta = ADJ_DIAG_BETA_DEG * ADJ_PI / 180.0f;
-  float L = fabsf(ax_mm) / sinf(beta);
-  float d = fabsf(ax_mm) / tanf(beta);
+  float L = fabsf(ax_mm) / sinf(beta) * ADJ_AXIAL_L_K;
+  float d = fabsf(ax_mm) / tanf(beta) * ADJ_AXIAL_D_K;
   float tilt = (ax_mm > 0 ? 1.0f : -1.0f) * (float)ADJ_AXIAL_SIGN;
+  float spin_deg = tilt * ADJ_DIAG_BETA_DEG;
   uint8_t rc;
-  printf("ADJ axial L=%dmm d=%dmm\r\n", (int)L, (int)d);
-  rc = Adj_Spin( tilt * ADJ_DIAG_BETA_DEG);  if(rc) return rc;
+  float got_spin1, got_L, got_spin2, got_d;
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "axgo ax%d L%d d%d b%d",
+             (int)ax_mm, (int)L, (int)d, (int)ADJ_DIAG_BETA_DEG);
+    Adj_Log(lb);
+  }
+  /* 1) 歪头 beta */
+  rc = Adj_Spin(spin_deg);  if(rc) return rc;
+  got_spin1 = g_adj_last_arc;
   if(Adj_Settle()) return 1;
-  rc = Adj_Move( +L );                       if(rc) return rc;   /* 斜着下去 */
+  /* 2) 斜行 L */
+  rc = Adj_Move( +L );      if(rc) return rc;
+  got_L = g_adj_last_mm;
   if(Adj_Settle()) return 1;
-  rc = Adj_Spin( -tilt * ADJ_DIAG_BETA_DEG); if(rc) return rc;   /* 摆正 */
+  /* 3) 摆正 */
+  rc = Adj_Spin(-spin_deg); if(rc) return rc;
+  got_spin2 = g_adj_last_arc;
   if(Adj_Settle()) return 1;
-  rc = Adj_Move( -d );                       if(rc) return rc;   /* 退回 */
+  /* 4) 周向补偿 d */
+  rc = Adj_Move( -d );      if(rc) return rc;
+  got_d = g_adj_last_mm;
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "axr s%d/%d L%d/%d",
+             (int)spin_deg, (int)got_spin1, (int)L, (int)got_L);
+    Adj_Log(lb);
+  }
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "axr2 r%d d%d/%d",
+             (int)got_spin2, (int)(-d), (int)got_d);
+    Adj_Log(lb);
+  }
   return 0;
 }
-/* 规划器入口: 三个偏差量 → 全部纠偏运动; 返回 0完成 1中止 2出错 */
+/* 融合纠偏规划 (保留 Adj_WaitLoop 视觉复测; 协议不变)
+ * 摄像头给出误差 φ(周向deg), ψ(航向deg), ax(轴向mm), 死区清零后:
+ *   ψ=0 表示车头已对齐「纯周向直行」姿态.
+ *   β = sign(ax)*ADJ_AXIAL_SIGN*ADJ_DIAG_BETA_DEG  目标斜航向(相对周向).
+ *
+ * 角度加减 (只在规划里用摄像头值做一次, 不再分段各纠一次):
+ *   1) 自旋角 θ1 = (β − ψ_cam) * ADJ_SPIN_SIGN
+ *      → 从当前航向 ψ 转到对角线 β (ψ=0 且 ax≠0 时退化为旧轴向歪头 β)
+ *   2) 斜行 L = |ax|/sin|β| * ADJ_AXIAL_L_K  (ax 只进长度, 不加成角度)
+ *      斜行周向分量 s_circ = L * cos|β| (mm, 沿 Move+ 方向)
+ *   3) 摆正 θ2 = (0 − β) * ADJ_SPIN_SIGN = −β*ADJ_SPIN_SIGN
+ *   4) 周向指令 mm:  dφ_cam − s_circ
+ *      即 φ 角先换成弧长再减斜行带上的周向; 等价于
+ *      φ_cmd_deg 层面: φ_cam − (s_circ / R / MV_SIGN)*(180/π)
+ *   ax≈0: 无斜行, θ=(0−ψ)*SIGN, 再 Move(dφ_cam) — 与旧「只纠航向+周向」一致.
+ * Settle 只插在真实运动段之后. */
+typedef enum {
+  ADJ_FSM_GATE_AX = 0,   /* 兼容旧遥测/日志枚举值, 规划已改为顺序融合 */
+  ADJ_FSM_AXIAL,
+  ADJ_FSM_SPIN,
+  ADJ_FSM_MOVE,
+  ADJ_FSM_DONE
+} ADJ_FSM_E;
+
+/* 规划器入口: 三个偏差量 → 融合运动; 返回 0完成 1中止 2出错
+ * 一次调用内跑完, 母机/App 协议不变; 步完成后仍回 REDY 可复测 */
 uint8_t Adj_Execute(float phi_deg, float psi_deg, float ax_mm){
-  /* 限幅已按用户要求去掉: 视觉/测试给多少就按多少执行(仍保留死区) */
   float phi = phi_deg * ADJ_DEMO_GAIN;
   float psi = psi_deg * ADJ_DEMO_GAIN;
   float ax  = ax_mm;
   uint8_t rc = 0;
+  float beta_deg, beta_rad, L, s_circ, dphi_mm, remain_mm, th;
+  uint8_t did_move = 0;
+
   Clear_All_PID();
   if(fabsf(phi) < ADJ_TOL_PHI) phi = 0;
   if(fabsf(psi) < ADJ_TOL_PSI) psi = 0;
   if(fabsf(ax)  < ADJ_TOL_AX)  ax  = 0;
-  printf("ADJ start phi=%d psi=%d ax=%d\r\n", (int)phi, (int)psi, (int)ax);
-  if(ax != 0){ rc = Adj_Axial(ax); if(rc) goto out; }              /* 最扰动先走 */
-  if(Adj_Settle()){ rc = 1; goto out; }
-  if(psi != 0){ rc = Adj_Spin(-psi * (float)ADJ_SPIN_SIGN); if(rc) goto out; }
-  if(Adj_Settle()){ rc = 1; goto out; }
-  if(phi != 0){
-    float dphi = phi * ADJ_PI / 180.0f * ADJ_PIPE_R_MM * (float)ADJ_MV_SIGN;
-#if ADJ_MOVE_TIMED
-    rc = Adj_MoveTimed(dphi);
-#else
-    rc = Adj_Move(dphi);
-#endif
-    if(rc) goto out;
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "start in %d/%d/%d -> %d/%d/%d",
+             (int)phi_deg, (int)psi_deg, (int)ax_mm, (int)phi, (int)psi, (int)ax);
+    Adj_Log(lb);
   }
-out:
+
+  dphi_mm = phi * ADJ_PI / 180.0f * ADJ_PIPE_R_MM * (float)ADJ_MV_SIGN;
+
+  if(ax != 0.0f){
+    /* --- 有轴向: 转到 β → 斜行 L → 摆正到 0 → 一次周向(φ−斜行周向) --- */
+    beta_deg = (ax > 0.0f ? 1.0f : -1.0f) * (float)ADJ_AXIAL_SIGN * ADJ_DIAG_BETA_DEG;
+    beta_rad = fabsf(beta_deg) * ADJ_PI / 180.0f;
+    L = fabsf(ax) / sinf(beta_rad) * ADJ_AXIAL_L_K;
+    s_circ = L * cosf(beta_rad);          /* Move(+L) 带上的周向 mm */
+    remain_mm = dphi_mm - s_circ;        /* 摄像头周向弧长 − 斜行周向 */
+
+    {
+      char lb[52];
+      snprintf(lb, sizeof(lb), "fuse b%d L%d sc%d r%d",
+               (int)beta_deg, (int)L, (int)s_circ, (int)remain_mm);
+      Adj_Log(lb);
+    }
+
+    /* 1) 航向: β − ψ_cam */
+    th = (beta_deg - psi) * (float)ADJ_SPIN_SIGN;
+    {
+      char lb[52];
+      snprintf(lb, sizeof(lb), "sp1 th%d (b-ps)", (int)th);
+      Adj_Log(lb);
+    }
+    rc = Adj_Spin(th);
+    if(rc) goto adj_done;
+    did_move = 1;
+    if(Adj_Settle()){ rc = 1; goto adj_done; }
+
+    /* 2) 斜行 */
+    rc = Adj_Move(+L);
+    if(rc) goto adj_done;
+    if(Adj_Settle()){ rc = 1; goto adj_done; }
+
+    /* 3) 摆正到 ψ=0: 0 − β */
+    th = (0.0f - beta_deg) * (float)ADJ_SPIN_SIGN;
+    {
+      char lb[52];
+      snprintf(lb, sizeof(lb), "sp2 th%d (0-b)", (int)th);
+      Adj_Log(lb);
+    }
+    rc = Adj_Spin(th);
+    if(rc) goto adj_done;
+    if(Adj_Settle()){ rc = 1; goto adj_done; }
+
+    /* 4) 更新后的周向 (不再单独加一次摄像头 φ) */
+    if(fabsf(remain_mm) >= 0.5f){
+#if ADJ_MOVE_TIMED
+      rc = Adj_MoveTimed(remain_mm);
+#else
+      rc = Adj_Move(remain_mm);
+#endif
+      if(rc) goto adj_done;
+    }
+  } else {
+    /* --- 无轴向: 只 (0−ψ) 自旋 + 摄像头周向 --- */
+    if(psi != 0.0f){
+      th = (0.0f - psi) * (float)ADJ_SPIN_SIGN;
+      {
+        char lb[52];
+        snprintf(lb, sizeof(lb), "sp0 th%d (0-ps)", (int)th);
+        Adj_Log(lb);
+      }
+      rc = Adj_Spin(th);
+      if(rc) goto adj_done;
+      did_move = 1;
+      if(Adj_Settle()){ rc = 1; goto adj_done; }
+    }
+    if(fabsf(dphi_mm) >= 0.5f){
+#if ADJ_MOVE_TIMED
+      rc = Adj_MoveTimed(dphi_mm);
+#else
+      rc = Adj_Move(dphi_mm);
+#endif
+      if(rc) goto adj_done;
+    } else if(!did_move){
+      /* 三量都在死区: 不空等 Settle */
+    }
+  }
+
+adj_done:
   motor_STOP();
-  printf("ADJ finish rc=%u\r\n", rc);
+  {
+    char lb[52];
+    snprintf(lb, sizeof(lb), "finish rc=%u", (unsigned)rc);
+    Adj_Log(lb);
+  }
   return rc;
 }
 /* 纠偏等待循环(GO_UP到位且已武装时进入):
