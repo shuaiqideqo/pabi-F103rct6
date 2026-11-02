@@ -795,16 +795,44 @@ static uint8_t Coop_DelayReport(uint32_t ms){
 static void Pi_SendCap(void);
 static void Ae_Poll(void);
 
-/* 舵机作业: 两轮抱死(A轮CH1/CH2 4199刹车 + B轮刹车), 风机加一档增强握持;
- * 顺带抽 Pi 预测结果(不阻塞) */
-static uint8_t Coop_ServoAHold(uint32_t ms){
+/* 零速主动保持(仅供上电自跑测试用): 目标0速闭环, 微滑立即反向出力(带积分抗持续外力),
+ * 完全静止时断电; 风机加一档(1639); 结构与ServoAHold一致(报IMU/抽Pi/可中止)。
+ * 真实协同的ServoAHold保持抱死不变 */
+static uint8_t Coop_ServoHoldActive(uint32_t ms){
   uint32_t t0 = HAL_GetTick();
+  float hold_i_a = 0.0f, hold_i_b = 0.0f;
   Clear_All_PID();
-  FENG_Motor_SET(3);   /* 风机加大一档(1539→1639): 作业期间靠吸附握持 */
+  FENG_Motor_SET(3);
   while(HAL_GetTick() - t0 < ms){
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
-    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
-    MB_STOP();
+    float va = MA_V_GET();
+    float vb = MB_V_GET();
+    int out_a, out_b;
+    hold_i_a += (-va) * 90.0f * 0.01f;
+    if(hold_i_a > 4000.0f) hold_i_a = 4000.0f; else if(hold_i_a < -4000.0f) hold_i_a = -4000.0f;
+    out_a = (int)((-va) * 18.0f + hold_i_a);
+    if(out_a > 4199) out_a = 4199; else if(out_a < -4199) out_a = -4199;
+    if(out_a > 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,0);
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,(uint16_t)out_a);
+    } else if(out_a < 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_1,(uint16_t)(-out_a));
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_2,0);
+    } else {
+      MA_STOP();
+    }
+    hold_i_b += (-vb) * 90.0f * 0.01f;
+    if(hold_i_b > 4000.0f) hold_i_b = 4000.0f; else if(hold_i_b < -4000.0f) hold_i_b = -4000.0f;
+    out_b = (int)((-vb) * 18.0f + hold_i_b);
+    if(out_b > 4199) out_b = 4199; else if(out_b < -4199) out_b = -4199;
+    if(out_b > 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,0);
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,(uint16_t)out_b);
+    } else if(out_b < 0){
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_3,(uint16_t)(-out_b));
+      __HAL_TIM_SET_COMPARE(&htim4,TIM_CHANNEL_4,0);
+    } else {
+      MB_STOP();
+    }
     Coop_ReportIMU();
     Ae_Poll();
     if(Coop_PollAbort()) return 1;
@@ -814,6 +842,12 @@ static uint8_t Coop_ServoAHold(uint32_t ms){
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
   return 0;
+}
+
+/* 舵机作业(协同AUTO用): 零速主动保持 — 与测试模式同一套逻辑,
+ * 目标0速闭环: 微滑立即反向出力(带积分), 静止断电; 风机加一档(1639)增强摩擦 */
+static uint8_t Coop_ServoAHold(uint32_t ms){
+  return Coop_ServoHoldActive(ms);
 }
 
 /* 探头从 DUO_NUM 线性慢抬到收回位(499), 共 lift_ms;
@@ -1062,8 +1096,8 @@ void AUTO(void){
     /* 通知 Pi 常驻服务开始采集; 不等待预测, 抬升不阻塞 */
     g_ae_pending = 0; g_ae_sent_ok = 0; g_ae_last_tx_ms = 0;
     Pi_SendCap();
-    /* 探头下压作业 10s */
-    if(Coop_ServoAHold(10000)) { g_coop_report_en = 0; motor_STOP(); return; }
+    /* 探头下压作业 22s */
+    if(Coop_ServoAHold(22000)) { g_coop_report_en = 0; motor_STOP(); return; }
     /* 作业后再加吸到1639, 再慢抬探头+往回爬 */
     FENG_PWM_SET = 1639;
     __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
@@ -1092,6 +1126,40 @@ void AUTO(void){
     Clear_All_PID();
     Coop_SendFrame(ACKD_RSP);
   }
+}
+
+/* ================= 上电自跑测试模式(单独新增, 不改任何既有逻辑) =================
+ * POWERON_SELF_TEST=1: 上电等5s → 自动跑一遍精简AUTO(无NRF握手/无树莓派CAP):
+ *   开风机1539稳1s → GO_DOWN(-85) → 刹车200ms → 探头下压作业20s(零速主动保持+风机1639)
+ *   → 1639稳500ms → 慢抬5s+回程GO_UP → 关风机停机, MODE回9手操待机
+ * 保留STOP/遥控中止; 正式版把宏置0即完全关闭本段 */
+#define POWERON_SELF_TEST 1
+
+static void PowerOnSelfTest(void){
+  printf("\r\n[SELFTEST] power-on self test\r\n");
+  while(HAL_GetTick() < 5000u){          /* 上电起5s */
+    if(Coop_PollAbort()){ printf("[SELFTEST] aborted\r\n"); return; }
+    HAL_Delay(10);
+  }
+  if(FENG_Motor_ON()) return;
+  if(Coop_DelayReport(1000)) return;
+  if(Compose_IMU()) return;
+  Clear_All_PID();
+  if(GO_DOWN(-85)) { motor_STOP(); return; }
+  motor_STOP();
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
+  if(Coop_DelayReport(200)) return;
+  DUO_Motor_ON(DUO_NUM);
+  if(Coop_ServoHoldActive(20000)) return;   /* 探头下压作业20s: 零速主动保持+风机1639, 无CAP */
+  FENG_PWM_SET = 1639;
+  __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
+  if(Coop_DelayReport(500)) return;
+  Clear_All_PID();
+  if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) { motor_STOP(); return; }
+  motor_STOP();
+  FENG_Motor_OFF();
+  printf("[SELFTEST] done\r\n");
 }
 /**
   * @brief  The application entry point.
@@ -2007,6 +2075,12 @@ int main(void)
   //Flash_Read(Flash_ReadNUM,2);//????? ??????
   //printf("Flash TEST : %d , %d \r\n",Flash_ReadNUM[0],Flash_ReadNUM[1]);
   uint32_t last_ctrl_time = micros();
+
+#if POWERON_SELF_TEST
+  /* 上电自跑测试: 5s后自动跑一遍, 结束回手操; 宏置0时本段不存在, 行为与原来完全一致 */
+  PowerOnSelfTest();
+  MODE = 9;
+#endif
 
   while (1)
   {
