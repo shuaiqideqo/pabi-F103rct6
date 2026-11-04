@@ -476,6 +476,7 @@ int8_t Arr_RX[32] = {0};
 static uint8_t Coop_PollAbort(void);
 static uint8_t Adj_WaitLoop(void);
 static uint8_t Test_WaitLoop(void);
+static uint8_t GO_DownTest(void);
 void Clear_All_PID(void);
 
 uint8_t FENG_Motor_ON(void){
@@ -844,6 +845,27 @@ static uint8_t Coop_ServoHoldActive(uint32_t ms){
   return 0;
 }
 
+/* 抱死对照版(仅供上电自跑测试A/B用): 与旧版ServoAHold相同的纯抱死保持,
+ * A轮CH1/CH2 4199刹车 + B轮刹车, 风机加一档(1639); 无主动出力 */
+static uint8_t Coop_ServoHoldBrake(uint32_t ms){
+  uint32_t t0 = HAL_GetTick();
+  Clear_All_PID();
+  FENG_Motor_SET(3);
+  while(HAL_GetTick() - t0 < ms){
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+    __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
+    MB_STOP();
+    Coop_ReportIMU();
+    Ae_Poll();
+    if(Coop_PollAbort()) return 1;
+    HAL_Delay(10);
+  }
+  motor_STOP();
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
+  __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
+  return 0;
+}
+
 /* 舵机作业(协同AUTO用): 零速主动保持 — 与测试模式同一套逻辑,
  * 目标0速闭环: 微滑立即反向出力(带积分), 静止断电; 风机加一档(1639)增强摩擦 */
 static uint8_t Coop_ServoAHold(uint32_t ms){
@@ -945,10 +967,12 @@ uint8_t GO_DOWN(float _degree){
       if(micros() - t_start > 30000000u) break;
       if((roll) >= _degree){
         float d_left = roll - _degree;
-        if (d_left < 5.0f) {
-          PID_IMU(0, -15);
-        } else if (d_left < 10.0f) {
-          PID_IMU(0, -40);
+        if (d_left < 10.0f) {
+          /* 最后10°: 速度随剩余角线性衰减(-40→0), 到线时轮子已近停,
+           * 消除"急断+滑行"造成的单轮多走/变斜 */
+          float v = 40.0f * d_left / 10.0f;
+          if(v < 3.0f) v = 3.0f;              /* 保底蠕速: 防静摩擦卡死吃掉30s超时 */
+          PID_IMU(0, (int)(-v));
         } else {
           PID_IMU(0, -100);
         }
@@ -966,22 +990,22 @@ uint8_t GO_DOWN(float _degree){
 uint8_t GO_UP(float _degree){
   uint32_t loop_time = micros();
   uint32_t t_start = micros();
-  uint8_t fan_cut2 = 0; /* 近顶(剩余<30°)降吸两档, 只做一次, 保持到 AUTO 结束 */
+  uint8_t fan_cut2 = 0; /* 近顶(剩余<35°)降吸两档, 只做一次, 保持到 AUTO 结束 */
   while(1){
     if (micros() - loop_time >= 10000) {
       loop_time = micros();
       if(micros() - t_start > 30000000u) return 2; /* 超时: 返回2, 调用方不再上报DONE */
       if((roll) <= _degree ){
         float d_left = _degree - roll;
-        /* 回来剩余角 <30°: 吸力降两档(每档 FENG_UP), 直到 FENG_Motor_OFF */
-        if(!fan_cut2 && d_left < 30.0f){
+        /* 回来剩余角 <35°: 吸力降两档(每档 FENG_UP), 直到 FENG_Motor_OFF */
+        if(!fan_cut2 && d_left < 35.0f){
           fan_cut2 = 1;
           if(FENG_PWM_SET > (uint16_t)(939u + 2u * FENG_UP))
             FENG_PWM_SET = (uint16_t)(FENG_PWM_SET - 2u * FENG_UP);
           else
             FENG_PWM_SET = 939;
           __HAL_TIM_SET_COMPARE(&htim5, TIM_CHANNEL_1, FENG_PWM_SET);
-          printf("GO_UP: fan-2 @<%ddeg -> %u\r\n", 30, (unsigned)FENG_PWM_SET);
+          printf("GO_UP: fan-2 @<%ddeg -> %u\r\n", 35, (unsigned)FENG_PWM_SET);
         }
         if (d_left < 5.0f) {
           PID_IMU(0, 40);   /* 最后5°减速, 与下行对称, 防过冲急刹 */
@@ -1085,29 +1109,46 @@ void AUTO(void){
 
     if(Compose_IMU()) { g_coop_report_en = 0; motor_STOP(); return; }
     Clear_All_PID();
-    if(GO_DOWN(-85)) { g_coop_report_en = 0; motor_STOP(); return; }   /* 最大下滑角85°(原90°) */
+    if(GO_DownTest()) { g_coop_report_en = 0; motor_STOP(); return; }   /* 下行移植自测试模式: -88°停+反向脉冲掐死 */
     motor_STOP();
     /* 下滑到位(-85°): A轮CH1/CH2都4199刹车, B轮仍刹车 */
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
     __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
 
     if(Coop_DelayReport(200)) { g_coop_report_en = 0; motor_STOP(); return; }
-    DUO_Motor_ON(DUO_NUM);
-    /* 通知 Pi 常驻服务开始采集; 不等待预测, 抬升不阻塞 */
-    g_ae_pending = 0; g_ae_sent_ok = 0; g_ae_last_tx_ms = 0;
-    Pi_SendCap();
-    /* 探头下压作业 22s */
-    if(Coop_ServoAHold(22000)) { g_coop_report_en = 0; motor_STOP(); return; }
-    /* 作业后再加吸到1639, 再慢抬探头+往回爬 */
-    FENG_PWM_SET = 1639;
-    __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
-    if(Coop_DelayReport(500)) { g_coop_report_en = 0; motor_STOP(); return; }
-
-    Clear_All_PID();
-    /* 探头 5s 慢抬; 抬起满 1s 后开始 GO_UP (与剩余抬升重叠)
-     * 0=到位 1=中止 2=超时。超时/中止都不上报DONE, 保持吸力回手动 */
-    if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) {
-      g_coop_report_en = 0; motor_STOP(); return;
+    /* 探头柔压(移植自测试模式): 499→778(25°) 线性1s(原瞬跳1055≈50°) */
+    {
+      uint32_t duo_saved = DUO_NUM;
+      uint16_t press_from = 499, press_to;
+      uint32_t press_ms = 1000;
+      uint32_t pt0 = HAL_GetTick();
+      uint16_t pos;
+      DUO_NUM = 778;                      /* 协同下压角度: 25°(2026-11-04 起, 原50°) */
+      press_to = (uint16_t)DUO_NUM;
+      while((uint32_t)(HAL_GetTick() - pt0) < press_ms){
+        pos = press_from + (uint16_t)(((uint32_t)(press_to - press_from)) * (HAL_GetTick() - pt0) / press_ms);
+        DUO_Motor_ON(pos);
+        Coop_ReportIMU();
+        Ae_Poll();
+        if(Coop_PollAbort()) { g_coop_report_en = 0; DUO_NUM = duo_saved; motor_STOP(); return; }
+        HAL_Delay(10);
+      }
+      DUO_Motor_ON(press_to);
+      /* 通知 Pi 常驻服务开始采集; 不等待预测, 抬升不阻塞 */
+      g_ae_pending = 0; g_ae_sent_ok = 0; g_ae_last_tx_ms = 0;
+      Pi_SendCap();
+      /* 探头下压作业 22s */
+      if(Coop_ServoAHold(22000)) { g_coop_report_en = 0; DUO_NUM = duo_saved; motor_STOP(); return; }
+      /* 作业后再加吸到1639, 再慢抬探头+往回爬 */
+      FENG_PWM_SET = 1639;
+      __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
+      Clear_All_PID();
+      /* 探头 5s 慢抬; 抬起满 1s 后开始 GO_UP (与剩余抬升重叠)
+       * 0=到位 1=中止 2=超时。超时/中止都不上报DONE, 保持吸力回手动 */
+      if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) {
+        g_coop_report_en = 0; DUO_NUM = duo_saved; motor_STOP(); return;
+      }
+      DUO_NUM = duo_saved;                /* 恢复1055: 下一轮循环/手动用 */
     }
     motor_STOP();
 
@@ -1130,10 +1171,60 @@ void AUTO(void){
 
 /* ================= 上电自跑测试模式(单独新增, 不改任何既有逻辑) =================
  * POWERON_SELF_TEST=1: 上电等5s → 自动跑一遍精简AUTO(无NRF握手/无树莓派CAP):
- *   开风机1539稳1s → GO_DOWN(-85) → 刹车200ms → 探头下压作业20s(零速主动保持+风机1639)
- *   → 1639稳500ms → 慢抬5s+回程GO_UP → 关风机停机, MODE回9手操待机
+ *   开风机1539稳1s → GO_DownTest(下到-88°,反向脉冲掐死) → 刹车200ms
+ *   → 柔压1s至探头25° → 作业20s(零速主动保持+风机1639) → 慢抬5s+回程GO_UP
+ *   → 关风机停机, MODE回9手操待机
  * 保留STOP/遥控中止; 正式版把宏置0即完全关闭本段 */
-#define POWERON_SELF_TEST 1
+#define POWERON_SELF_TEST 0
+
+/* 测试模式专用下行: 斜坡锚定-90(速度形状与协同一致), 实际停止点提前到-88,
+ * 到点瞬间"反向脉冲"(反接制动)主动杀掉残余转速再归中抱死 —— 真·掐死。
+ * 仅上电自跑调用; 协同的GO_DOWN保持原样(-90, 比例减速+自然滑停) */
+#define DOWNTEST_STOP_DEG   (-88.0f)   /* 实际停止点 */
+#define DOWNTEST_RAMP_DEG   (-90.0f)   /* 斜坡锚点(只决定速度形状) */
+#define DOWNKILL_DUTY       2000u      /* 反向脉冲占空比(0~4199) */
+#define DOWNKILL_MS         80u        /* 反向脉冲时长 */
+
+static uint8_t GO_DownTest(void){
+  uint32_t loop_time = micros();
+  uint32_t t_start = micros();
+  while(1){
+    if (micros() - loop_time >= 10000) {
+      loop_time = micros();
+      if(micros() - t_start > 30000000u) break;   /* 30s超时 */
+      if((roll) >= DOWNTEST_STOP_DEG){
+        float d_ramp = roll - DOWNTEST_RAMP_DEG;  /* 距斜坡锚点的剩余 */
+        float v;
+        if (d_ramp < 10.0f) {
+          v = 40.0f * d_ramp / 10.0f;             /* -88°处 v=8, 斜坡连续 */
+        } else {
+          v = 100.0f;
+        }
+        PID_IMU(0, (int)(-v));
+      }
+      else{
+        break;                                    /* roll < -88 → 到停止点 */
+      }
+      Coop_ReportIMU();
+      if(Coop_PollAbort()) return 1;
+    }
+  }
+  /* 掐死: 反向(上行)脉冲主动杀掉下行残余转速(反接制动) → 归中抱死 */
+  {
+    uint32_t k0 = HAL_GetTick();
+    while(HAL_GetTick() - k0 < DOWNKILL_MS){
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 0);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, DOWNKILL_DUTY);   /* A轮上行 */
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_3, 0);
+      __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_4, DOWNKILL_DUTY);   /* B轮上行 */
+      Coop_ReportIMU();
+      if(Coop_PollAbort()) return 1;
+      HAL_Delay(10);
+    }
+  }
+  motor_STOP();                                   /* 归中: 四通道4199抱死 */
+  return 0;
+}
 
 static void PowerOnSelfTest(void){
   printf("\r\n[SELFTEST] power-on self test\r\n");
@@ -1145,21 +1236,40 @@ static void PowerOnSelfTest(void){
   if(Coop_DelayReport(1000)) return;
   if(Compose_IMU()) return;
   Clear_All_PID();
-  if(GO_DOWN(-85)) { motor_STOP(); return; }
+  if(GO_DownTest()) { motor_STOP(); return; }   /* 测试模式: 下到-88°反向脉冲掐死 */
   motor_STOP();
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_1, 4199);
   __HAL_TIM_SET_COMPARE(&htim4, TIM_CHANNEL_2, 4199);
   if(Coop_DelayReport(200)) return;
-  DUO_Motor_ON(DUO_NUM);
-  if(Coop_ServoHoldActive(20000)) return;   /* 探头下压作业20s: 零速主动保持+风机1639, 无CAP */
-  FENG_PWM_SET = 1639;
-  __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
-  if(Coop_DelayReport(500)) return;
-  Clear_All_PID();
-  if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) { motor_STOP(); return; }
-  motor_STOP();
-  FENG_Motor_OFF();
-  printf("[SELFTEST] done\r\n");
+  {
+    uint32_t duo_saved = DUO_NUM;
+    uint16_t press_from = 499, press_to;
+    uint32_t press_ms = 1000;               /* 柔压时长: 原0s瞬跳, 1s缓压 */
+    uint32_t pt0;
+    uint16_t pos;
+    DUO_NUM = 778;                          /* 测试模式: 探头下压25°(778; 协同为1055≈50°) */
+    press_to = (uint16_t)DUO_NUM;
+    /* 柔压: 499→778 线性压2s(原瞬跳), 期间报IMU/可中止 */
+    pt0 = HAL_GetTick();
+    while((uint32_t)(HAL_GetTick() - pt0) < press_ms){
+      pos = press_from + (uint16_t)(((uint32_t)(press_to - press_from)) * (HAL_GetTick() - pt0) / press_ms);
+      DUO_Motor_ON(pos);
+      Coop_ReportIMU();
+      Ae_Poll();
+      if(Coop_PollAbort()) { DUO_NUM = duo_saved; return; }
+      HAL_Delay(10);
+    }
+    DUO_Motor_ON(press_to);
+    if(Coop_ServoHoldActive(20000)) { DUO_NUM = duo_saved; return; }  /* 作业20s: 零速主动保持+风机1639, 无CAP */
+    FENG_PWM_SET = 1639;
+    __HAL_TIM_SET_COMPARE(&htim5,TIM_CHANNEL_1,FENG_PWM_SET);
+    Clear_All_PID();
+    if(Coop_LiftThenGoUp(roll_Compose, 5000, 1000)) { motor_STOP(); DUO_NUM = duo_saved; return; }
+    motor_STOP();
+    FENG_Motor_OFF();
+    DUO_NUM = duo_saved;                    /* 恢复1055, 不影响后续协同/手动 */
+    printf("[SELFTEST] done\r\n");
+  }
 }
 /**
   * @brief  The application entry point.
